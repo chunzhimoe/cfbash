@@ -1,188 +1,40 @@
 #!/usr/bin/env bash
-# metrics-agent.sh — Lightweight HTTP metrics server for SSH Launcher
-# Serves JSON at http://localhost:9101/metrics.json
-# Requires: bash, python3 (standard library only), optional: nvidia-smi
+# metrics-agent.sh — Install metrics_server.py as a systemd service
+# Serves JSON at http://127.0.0.1:9101/metrics.json
 #
 # Usage:
 #   sudo bash metrics-agent.sh install   # Install + start as systemd service
 #   sudo bash metrics-agent.sh start     # Run in foreground (testing)
+#
+# The Python script (metrics_server.py) must be in the same directory,
+# or downloadable from GitHub.
 
 set -euo pipefail
 
 METRICS_PORT="${METRICS_PORT:-9101}"
 INSTALL_DIR="/usr/local/lib/ssh-metrics"
-
-# ─── Metrics collection script (Python) ───────────────────────────────────────
-
-write_collector() {
-  mkdir -p "$INSTALL_DIR"
-  cat > "$INSTALL_DIR/metrics_server.py" <<'PYEOF'
-#!/usr/bin/env python3
-import json, os, time, subprocess, socket
-from http.server import HTTPServer, BaseHTTPRequestHandler
-
-def read_file(path):
-    try:
-        with open(path) as f:
-            return f.read()
-    except Exception:
-        return ""
-
-def cpu_percent():
-    """Read CPU usage from /proc/stat (two samples, 200ms apart)."""
-    def read_stat():
-        line = read_file("/proc/stat").split("\n")[0]
-        fields = list(map(int, line.split()[1:]))
-        idle = fields[3] + (fields[4] if len(fields) > 4 else 0)
-        total = sum(fields)
-        return idle, total
-    i1, t1 = read_stat()
-    time.sleep(0.2)
-    i2, t2 = read_stat()
-    dt = t2 - t1
-    if dt == 0:
-        return 0.0
-    return round((1 - (i2 - i1) / dt) * 100, 1)
-
-def memory():
-    raw = {}
-    for line in read_file("/proc/meminfo").splitlines():
-        if ":" in line:
-            k, v = line.split(":", 1)
-            raw[k.strip()] = int(v.strip().split()[0])
-    total = raw.get("MemTotal", 0)
-    avail = raw.get("MemAvailable", raw.get("MemFree", 0))
-    used = total - avail
-    pct = round(used / total * 100, 1) if total else 0
-    return {"used": used, "total": total, "percent": pct}
-
-def disk():
-    try:
-        st = os.statvfs("/")
-        total = st.f_blocks * st.f_frsize // 1024
-        avail = st.f_bavail * st.f_frsize // 1024
-        used = total - avail
-        pct = round(used / total * 100, 1) if total else 0
-        return {"used": used, "total": total, "percent": pct}
-    except Exception:
-        return {"used": 0, "total": 0, "percent": 0}
-
-_prev_net = {}
-def network():
-    global _prev_net
-    iface_stats = {}
-    for line in read_file("/proc/net/dev").splitlines()[2:]:
-        parts = line.split()
-        if len(parts) < 10:
-            continue
-        iface = parts[0].rstrip(":")
-        if iface == "lo":
-            continue
-        iface_stats[iface] = {"rx": int(parts[1]), "tx": int(parts[9])}
-    now = time.time()
-    result = {"rxBytesPerSec": 0, "txBytesPerSec": 0}
-    if _prev_net:
-        dt = now - _prev_net["ts"]
-        if dt > 0:
-            for iface, vals in iface_stats.items():
-                prev = _prev_net.get(iface, {})
-                if prev:
-                    result["rxBytesPerSec"] += max(0, int((vals["rx"] - prev["rx"]) / dt))
-                    result["txBytesPerSec"] += max(0, int((vals["tx"] - prev["tx"]) / dt))
-    _prev_net = {"ts": now, **{k: v for k, v in iface_stats.items()}}
-    return result
-
-def load_avg():
-    try:
-        parts = read_file("/proc/loadavg").split()
-        return [float(parts[0]), float(parts[1]), float(parts[2])]
-    except Exception:
-        return [0.0, 0.0, 0.0]
-
-def uptime():
-    try:
-        return float(read_file("/proc/uptime").split()[0])
-    except Exception:
-        return 0.0
-
-def gpu_info():
-    try:
-        out = subprocess.check_output([
-            "nvidia-smi",
-            "--query-gpu=name,temperature.gpu,utilization.gpu,memory.used,memory.total",
-            "--format=csv,noheader,nounits"
-        ], timeout=3, stderr=subprocess.DEVNULL).decode()
-        gpus = []
-        for line in out.strip().splitlines():
-            parts = [p.strip() for p in line.split(",")]
-            if len(parts) >= 5:
-                gpus.append({
-                    "name": parts[0],
-                    "tempC": int(parts[1]),
-                    "utilPercent": int(parts[2]),
-                    "memUsedMiB": int(parts[3]),
-                    "memTotalMiB": int(parts[4]),
-                })
-        return gpus
-    except Exception:
-        return None
-
-def collect():
-    data = {
-        "hostname": socket.gethostname(),
-        "timestamp": int(time.time() * 1000),
-        "cpu": cpu_percent(),
-        "memory": memory(),
-        "disk": disk(),
-        "network": network(),
-        "load": load_avg(),
-        "uptime": uptime(),
-    }
-    gpu = gpu_info()
-    if gpu is not None:
-        data["gpu"] = gpu
-    return data
-
-class Handler(BaseHTTPRequestHandler):
-    def log_message(self, *_):
-        pass
-
-    def do_GET(self):
-        if self.path not in ("/metrics.json", "/"):
-            self.send_response(404)
-            self.end_headers()
-            return
-        try:
-            payload = json.dumps(collect()).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(payload)))
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            self.wfile.write(payload)
-        except Exception as e:
-            self.send_response(500)
-            self.end_headers()
-            self.wfile.write(str(e).encode())
-
-if __name__ == "__main__":
-    import sys
-    port = int(os.environ.get("METRICS_PORT", 9101))
-    server = HTTPServer(("127.0.0.1", port), Handler)
-    print(f"metrics-agent listening on 127.0.0.1:{port}", file=sys.stderr)
-    server.serve_forever()
-PYEOF
-  chmod +x "$INSTALL_DIR/metrics_server.py"
-}
-
-# ─── Systemd service ──────────────────────────────────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_RAW="https://raw.githubusercontent.com/chunzhimoe/cfbash/main"
 
 install_service() {
-  write_collector
+  mkdir -p "$INSTALL_DIR"
+
+  # Use local file if present, otherwise download
+  if [[ -f "$SCRIPT_DIR/metrics_server.py" ]]; then
+    cp "$SCRIPT_DIR/metrics_server.py" "$INSTALL_DIR/metrics_server.py"
+  else
+    curl -fsSL "${REPO_RAW}/metrics_server.py" -o "$INSTALL_DIR/metrics_server.py"
+  fi
+  chmod +x "$INSTALL_DIR/metrics_server.py"
+
+  # Verify python3 works
+  if ! python3 "$INSTALL_DIR/metrics_server.py" --help &>/dev/null; then
+    python3 -c "print('python3 OK')" || { echo "ERROR: python3 not found"; exit 1; }
+  fi
 
   cat > /etc/systemd/system/ssh-metrics.service <<EOF
 [Unit]
-Description=SSH Launcher Metrics Agent
+Description=SSH Console Metrics Agent
 After=network.target
 Wants=network.target
 
@@ -201,18 +53,28 @@ EOF
 
   systemctl daemon-reload
   systemctl enable --now ssh-metrics.service
+
+  echo ""
   echo "✓ ssh-metrics.service installed and started on port ${METRICS_PORT}"
   echo "  Test: curl http://localhost:${METRICS_PORT}/metrics.json"
+  echo ""
+  systemctl status ssh-metrics.service --no-pager || true
 }
-
-# ─── Entry point ─────────────────────────────────────────────────────────────
 
 case "${1:-start}" in
   install)
     install_service
     ;;
   start)
-    write_collector
+    if [[ ! -f "$INSTALL_DIR/metrics_server.py" ]]; then
+      mkdir -p "$INSTALL_DIR"
+      if [[ -f "$SCRIPT_DIR/metrics_server.py" ]]; then
+        cp "$SCRIPT_DIR/metrics_server.py" "$INSTALL_DIR/metrics_server.py"
+      else
+        curl -fsSL "${REPO_RAW}/metrics_server.py" -o "$INSTALL_DIR/metrics_server.py"
+      fi
+      chmod +x "$INSTALL_DIR/metrics_server.py"
+    fi
     exec python3 "$INSTALL_DIR/metrics_server.py"
     ;;
   *)
