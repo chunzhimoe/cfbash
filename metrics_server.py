@@ -4,7 +4,7 @@ Serves JSON at http://127.0.0.1:{port}/metrics.json
 Requires: Python 3 (stdlib only), optional: nvidia-smi
 """
 
-import json, os, time, subprocess, socket
+import json, os, time, subprocess, socket, sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 
