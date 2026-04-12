@@ -50,6 +50,10 @@ warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 err()   { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 step()  { echo -e "\n${CYAN}===> $*${NC}"; }
 
+is_interactive() {
+  [[ -t 0 && -t 1 ]]
+}
+
 # ----- 默认值 -----
 CA_PUBKEY="ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBNaOWfUfFLTlHn0EwdTk1Qs0gljISZ4o1ycKO/Aw9ZvzKmY16pFJ5Tg1ktXpR0t6s/CFIOCkPG9v9ZxiJ0yC83s= open-ssh-ca@cloudflareaccess.org"
 SSO_EMAIL="aizfun.top@foxmail.com"
@@ -551,7 +555,7 @@ install_metrics_agent() {
     return 0
   fi
 
-  local SCRIPT_URL="https://raw.githubusercontent.com/chunzhimoe/cf-status/main/metrics-agent.sh"
+  local SCRIPT_URL="https://raw.githubusercontent.com/chunzhimoe/cfbash/main/metrics-agent.sh"
   info "下载并安装 metrics-agent..."
   curl -fsSL "$SCRIPT_URL" -o /tmp/metrics-agent.sh
   bash /tmp/metrics-agent.sh install
@@ -584,10 +588,15 @@ main() {
   echo ""
 
   if [[ "$DRY_RUN" != true ]]; then
-    read -rp "确认以上配置并继续？[Y/n] " confirm
-    if [[ "${confirm,,}" =~ ^n ]]; then
-      info "已取消"
-      exit 0
+    if is_interactive; then
+      local confirm=""
+      read -rp "确认以上配置并继续？[Y/n] " confirm
+      if [[ "${confirm,,}" =~ ^n ]]; then
+        info "已取消"
+        exit 0
+      fi
+    else
+      warn "检测到非交互模式，跳过确认提示并继续执行"
     fi
   fi
 
