@@ -19,8 +19,26 @@ REPO_RAW="https://raw.githubusercontent.com/chunzhimoe/cfbash/main"
 PYTHON_BIN="${PYTHON_BIN:-$(command -v python3 || true)}"
 
 ensure_python() {
+  if [[ -n "$PYTHON_BIN" ]] && command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+    PYTHON_BIN="$(command -v "$PYTHON_BIN")"
+    return 0
+  fi
+
+  if command -v python3 >/dev/null 2>&1; then
+    PYTHON_BIN="$(command -v python3)"
+    return 0
+  fi
+
+  if command -v apt-get >/dev/null 2>&1; then
+    echo "python3 not found; installing python3..."
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y -qq python3
+    PYTHON_BIN="$(command -v python3 || true)"
+  fi
+
   if [[ -z "$PYTHON_BIN" ]]; then
-    echo "ERROR: python3 not found" >&2
+    echo "ERROR: python3 not found and could not be installed automatically" >&2
     exit 1
   fi
 }
