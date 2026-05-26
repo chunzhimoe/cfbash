@@ -21,16 +21,19 @@
 #     sudo bash setup-cf-browser-ssh.sh \
 #       --ca-pubkey "ecdsa-sha2-nistp256 AAAA... open-ssh-ca@cloudflareaccess.org" \
 #       --sso-email admin@example.com \
+#       --sso-email ops@example.com \
 #       --tunnel-token "eyJhIjoiNz..."
 #
 # 选项：
 #   --ca-pubkey <string|filepath>  Cloudflare short-lived CA 公钥（内容或文件路径）
-#   --sso-email <email>            Cloudflare SSO 登录邮箱（用于提取用户名）
-#   --login-user <username>        浏览器终端登录的 Linux 用户（默认：root）
+#   --sso-email <email>            Cloudflare SSO 登录邮箱，可重复；也支持逗号分隔
+#   --sso-emails <email,...>       多个 Cloudflare SSO 登录邮箱
+#   --login-user <username>        直接指定 Linux 用户，可重复；也支持逗号分隔
+#   --login-users <user,...>       多个 Linux 用户
 #   --tunnel-token <token>         cloudflared Tunnel Token（可选，不传则跳过服务注册）
 #   --skip-cloudflared             跳过 cloudflared 安装
 #   --metrics-port <port>          metrics 监听端口（默认：9101）
-#   --allow-all-principals         允许任意 Access 用户登录 --login-user（默认开启 root 时自动启用）
+#   --allow-all-principals         允许任意 Access 用户登录指定 Linux 用户（默认开启 root 时自动启用）
 #   --dry-run                      只打印将要执行的操作，不实际修改
 #   -h, --help                     显示帮助
 #
@@ -58,8 +61,8 @@ is_interactive() {
 
 # ----- 默认值 -----
 CA_PUBKEY="ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBNaOWfUfFLTlHn0EwdTk1Qs0gljISZ4o1ycKO/Aw9ZvzKmY16pFJ5Tg1ktXpR0t6s/CFIOCkPG9v9ZxiJ0yC83s= open-ssh-ca@cloudflareaccess.org"
-SSO_EMAIL="aizfun.top@foxmail.com"
-LOGIN_USER=""
+SSO_EMAILS=()
+LOGIN_USERS=()
 TUNNEL_TOKEN=""
 METRICS_PORT="${METRICS_PORT:-9101}"
 SKIP_CLOUDFLARED=false
@@ -82,6 +85,87 @@ extract_tunnel_token() {
   echo "$input"
 }
 
+trim_value() {
+  echo "$1" | xargs
+}
+
+add_unique_sso_email() {
+  local email
+  email="$(trim_value "$1")"
+  [[ -z "$email" ]] && return 0
+  local existing
+  for existing in "${SSO_EMAILS[@]}"; do
+    [[ "$existing" == "$email" ]] && return 0
+  done
+  SSO_EMAILS+=("$email")
+}
+
+add_unique_login_user() {
+  local user
+  user="$(trim_value "$1")"
+  [[ -z "$user" ]] && return 0
+  local existing
+  for existing in "${LOGIN_USERS[@]}"; do
+    [[ "$existing" == "$user" ]] && return 0
+  done
+  LOGIN_USERS+=("$user")
+}
+
+add_sso_emails() {
+  local raw="$1"
+  raw="${raw//$'\n'/,}"
+  raw="${raw//;/,}"
+  raw="${raw//，/,}"
+  raw="${raw//,/ }"
+  local item
+  for item in $raw; do
+    add_unique_sso_email "$item"
+  done
+}
+
+add_login_users() {
+  local raw="$1"
+  raw="${raw//$'\n'/,}"
+  raw="${raw//;/,}"
+  raw="${raw//，/,}"
+  raw="${raw//,/ }"
+  local item
+  for item in $raw; do
+    add_unique_login_user "$item"
+  done
+}
+
+derive_login_users_from_sso() {
+  local email user
+  for email in "${SSO_EMAILS[@]}"; do
+    user="${email%%@*}"
+    add_unique_login_user "$user"
+    info "从邮箱 '$email' 提取的登录用户名: $user"
+  done
+}
+
+has_login_user() {
+  local target="$1"
+  local user
+  for user in "${LOGIN_USERS[@]}"; do
+    [[ "$user" == "$target" ]] && return 0
+  done
+  return 1
+}
+
+join_values() {
+  local result=""
+  local item
+  for item in "$@"; do
+    if [[ -z "$result" ]]; then
+      result="$item"
+    else
+      result="$result, $item"
+    fi
+  done
+  echo "$result"
+}
+
 SSHD_CONFIG="/etc/ssh/sshd_config"
 CA_PUB_FILE="/etc/ssh/ca.pub"
 BACKUP_SUFFIX="bak.$(date +%Y%m%d_%H%M%S)"
@@ -90,8 +174,8 @@ BACKUP_SUFFIX="bak.$(date +%Y%m%d_%H%M%S)"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --ca-pubkey)          CA_PUBKEY="$2";            shift 2 ;;
-    --sso-email)          SSO_EMAIL="$2";            shift 2 ;;
-    --login-user)         LOGIN_USER="$2";           shift 2 ;;
+    --sso-email|--sso-emails) add_sso_emails "$2";   shift 2 ;;
+    --login-user|--login-users) add_login_users "$2"; shift 2 ;;
     --tunnel-token)       TUNNEL_TOKEN="$(extract_tunnel_token "$2")"; shift 2 ;;
     --skip-cloudflared)   SKIP_CLOUDFLARED=true;     shift   ;;
     --metrics-port)       METRICS_PORT="$2";         shift 2 ;;
@@ -159,26 +243,31 @@ prompt_missing_params() {
   fi
 
   # SSO 邮箱 → 登录用户名
-  if [[ -z "$LOGIN_USER" ]]; then
-    if [[ -z "$SSO_EMAIL" ]]; then
+  if [[ ${#LOGIN_USERS[@]} -eq 0 && ${#SSO_EMAILS[@]} -eq 0 ]]; then
+    if is_interactive; then
+      local sso_input=""
       echo ""
       echo -e "  ${YELLOW}⚠️  重要：Cloudflare 浏览器 SSH 强制使用 SSO 邮箱前缀作为用户名${NC}"
       echo "  例如：admin@moe.tips → 用户名自动变为 admin"
-      echo "  你无法在浏览器终端里选择用户名，它由邮箱前缀决定。"
+      echo "  多用户请用逗号分隔，或在非交互模式重复传入 --sso-email。"
       echo ""
-      read -rp "请输入你的 Cloudflare SSO 登录邮箱: " SSO_EMAIL
-    fi
-    if [[ -n "$SSO_EMAIL" ]]; then
-      LOGIN_USER="${SSO_EMAIL%%@*}"
-      info "从邮箱 '$SSO_EMAIL' 提取的登录用户名: $LOGIN_USER"
+      read -rp "请输入 Cloudflare SSO 登录邮箱: " sso_input
+      add_sso_emails "$sso_input"
     else
-      LOGIN_USER="root"
-      warn "未提供邮箱，默认使用 root（仅当你的邮箱前缀是 root 时才有效）"
+      err "非交互模式必须提供至少一个 --sso-email 或 --login-user"
+      exit 1
     fi
   fi
 
+  derive_login_users_from_sso
+
+  if [[ ${#LOGIN_USERS[@]} -eq 0 ]]; then
+    err "未解析到任何 Linux 登录用户"
+    exit 1
+  fi
+
   # root 模式自动启用 allow-all-principals
-  if [[ "$LOGIN_USER" == "root" ]]; then
+  if has_login_user "root"; then
     ALLOW_ALL_PRINCIPALS=true
   fi
 
@@ -315,7 +404,7 @@ configure_sshd() {
     info "[DRY-RUN]   PubkeyAuthentication yes"
     info "[DRY-RUN]   TrustedUserCAKeys $CA_PUB_FILE"
     if [[ "$ALLOW_ALL_PRINCIPALS" == true ]]; then
-      info "[DRY-RUN]   AuthorizedPrincipalsCommand (allow all for $LOGIN_USER)"
+      info "[DRY-RUN]   AuthorizedPrincipalsCommand (allow all for $(join_values "${LOGIN_USERS[@]}"))"
     fi
     return 0
   fi
@@ -358,11 +447,14 @@ configure_sshd() {
 
   # --- 用户名映射（root / 共享账号模式）---
   if [[ "$ALLOW_ALL_PRINCIPALS" == true ]]; then
-    configure_principals "$LOGIN_USER"
+    local principal_user
+    for principal_user in "${LOGIN_USERS[@]}"; do
+      configure_principals "$principal_user"
+    done
   fi
 
   # --- 确保 PermitRootLogin 允许公钥登录（仅 root 模式）---
-  if [[ "$LOGIN_USER" == "root" ]]; then
+  if has_login_user "root"; then
     ensure_root_login
   fi
 
@@ -520,23 +612,23 @@ print_next_steps() {
   echo "     → 完成 SSO 登录后，应直接进入网页 SSH 终端"
   echo ""
   echo -e "  ${YELLOW}ℹ️  浏览器终端强制使用 SSO 邮箱前缀作为用户名${NC}"
-  echo "     你必须用邮箱前缀为 '${LOGIN_USER}' 的账号登录 SSO"
-  if [[ -n "$SSO_EMAIL" ]]; then
-    echo "     即使用: ${SSO_EMAIL}"
+  echo "     已创建 Linux 用户: $(join_values "${LOGIN_USERS[@]}")"
+  if [[ ${#SSO_EMAILS[@]} -gt 0 ]]; then
+    echo "     已配置 SSO 邮箱: $(join_values "${SSO_EMAILS[@]}")"
   fi
   echo ""
 
-  if [[ "$LOGIN_USER" == "root" ]]; then
+  if has_login_user "root"; then
     echo -e "  ${YELLOW}⚠️  重要提醒：${NC}"
     echo -e "  ${YELLOW}    你配置的是 root 登录模式。${NC}"
-    echo -e "  ${YELLOW}    只有邮箱前缀为 'root' 的 SSO 账号才能通过浏览器 SSH 登录！${NC}"
+    echo -e "  ${YELLOW}    root 会启用 AuthorizedPrincipalsCommand，实际可访问人员由 Access Policy 控制。${NC}"
     echo -e "  ${YELLOW}    服务器安全性完全依赖 Access Policy，确保只允许受信任的用户访问！${NC}"
     echo ""
-  else
-    echo -e "  ${GREEN}✅  服务器已配置用户 '${LOGIN_USER}'（带 sudo 权限）${NC}"
-    echo "     登录后可用 sudo -i 获取 root shell"
-    echo ""
   fi
+
+  echo -e "  ${GREEN}✅  服务器已配置 ${#LOGIN_USERS[@]} 个用户（非 root 用户带 sudo 权限）${NC}"
+  echo "     登录后可用 sudo -i 获取 root shell"
+  echo ""
 
   if [[ -z "$TUNNEL_TOKEN" && "$SKIP_CLOUDFLARED" != true ]]; then
     echo "  ⓘ  cloudflared 已安装但 Tunnel 服务未注册。"
@@ -609,8 +701,8 @@ main() {
 
   echo ""
   info "配置摘要："
-  info "  SSO 邮箱:          ${SSO_EMAIL:-(未提供)}"
-  info "  登录用户:          $LOGIN_USER"
+  info "  SSO 邮箱:          $( [[ ${#SSO_EMAILS[@]} -gt 0 ]] && join_values "${SSO_EMAILS[@]}" || echo '未提供' )"
+  info "  登录用户:          $(join_values "${LOGIN_USERS[@]}")"
   info "  允许任意 principal: $ALLOW_ALL_PRINCIPALS"
   info "  安装 cloudflared:  $( [[ "$SKIP_CLOUDFLARED" == true ]] && echo '跳过' || echo '是' )"
   info "  Tunnel Token:      $( [[ -n "$TUNNEL_TOKEN" ]] && echo '已提供' || echo '未提供' )"
@@ -643,7 +735,10 @@ main() {
   write_ca_pubkey
 
   # 3. 创建登录用户
-  create_login_user "$LOGIN_USER"
+  local login_user
+  for login_user in "${LOGIN_USERS[@]}"; do
+    create_login_user "$login_user"
+  done
 
   # 4. sshd 配置
   configure_sshd
