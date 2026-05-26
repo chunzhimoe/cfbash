@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """metrics_server.py — Lightweight HTTP metrics server.
-Serves JSON at http://127.0.0.1:{port}/metrics.json
+Serves JSON at http://{host}:{port}/metrics.json
 Requires: Python 3 (stdlib only), optional: nvidia-smi
 """
 
@@ -173,8 +173,17 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(str(e).encode())
 
 
-if __name__ == "__main__":
+def main():
+    if any(arg in ("-h", "--help") for arg in sys.argv[1:]):
+        print("Usage: METRICS_HOST=127.0.0.1 METRICS_PORT=9101 metrics_server.py")
+        return
+
+    host = os.environ.get("METRICS_HOST", "127.0.0.1")
     port = int(os.environ.get("METRICS_PORT", "9101"))
-    server = HTTPServer(("127.0.0.1", port), Handler)
-    print(f"metrics-agent listening on 127.0.0.1:{port}", file=sys.stderr)
+    server = HTTPServer((host, port), Handler)
+    print(f"metrics-agent listening on {host}:{port}", file=sys.stderr)
     server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

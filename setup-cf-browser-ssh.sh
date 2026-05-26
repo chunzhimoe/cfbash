@@ -10,7 +10,8 @@
 #   3. 写入 Cloudflare CA 公钥到 /etc/ssh/ca.pub
 #   4. 配置 sshd_config 信任 Cloudflare CA
 #   5. 配置用户名映射（支持 root 共享登录）
-#   6. 校验 sshd 配置并 reload
+#   6. 安装本机 metrics 监控探针
+#   7. 校验 sshd 配置并 reload
 #
 # 用法：
 #   交互式（推荐）：
@@ -28,6 +29,7 @@
 #   --login-user <username>        浏览器终端登录的 Linux 用户（默认：root）
 #   --tunnel-token <token>         cloudflared Tunnel Token（可选，不传则跳过服务注册）
 #   --skip-cloudflared             跳过 cloudflared 安装
+#   --metrics-port <port>          metrics 监听端口（默认：9101）
 #   --allow-all-principals         允许任意 Access 用户登录 --login-user（默认开启 root 时自动启用）
 #   --dry-run                      只打印将要执行的操作，不实际修改
 #   -h, --help                     显示帮助
@@ -59,9 +61,12 @@ CA_PUBKEY="ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAA
 SSO_EMAIL="aizfun.top@foxmail.com"
 LOGIN_USER=""
 TUNNEL_TOKEN=""
+METRICS_PORT="${METRICS_PORT:-9101}"
 SKIP_CLOUDFLARED=false
 ALLOW_ALL_PRINCIPALS=false
 DRY_RUN=false
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # 从完整命令或纯 token 中提取 tunnel token
 # 支持输入: "sudo cloudflared service install eyJ..." 或直接 "eyJ..."
@@ -89,6 +94,7 @@ while [[ $# -gt 0 ]]; do
     --login-user)         LOGIN_USER="$2";           shift 2 ;;
     --tunnel-token)       TUNNEL_TOKEN="$(extract_tunnel_token "$2")"; shift 2 ;;
     --skip-cloudflared)   SKIP_CLOUDFLARED=true;     shift   ;;
+    --metrics-port)       METRICS_PORT="$2";         shift 2 ;;
     --allow-all-principals) ALLOW_ALL_PRINCIPALS=true; shift ;;
     --dry-run)            DRY_RUN=true;              shift   ;;
     -h|--help)
@@ -98,6 +104,11 @@ while [[ $# -gt 0 ]]; do
     *) err "未知参数: $1"; exit 1 ;;
   esac
 done
+
+if [[ ! "$METRICS_PORT" =~ ^[0-9]+$ ]] || (( METRICS_PORT < 1 || METRICS_PORT > 65535 )); then
+  err "--metrics-port 必须是 1-65535 的数字"
+  exit 1
+fi
 
 # ----- 前置检查 -----
 check_root() {
@@ -538,6 +549,7 @@ print_next_steps() {
   echo "    CA 公钥:     $CA_PUB_FILE"
   echo "    sshd_config: $SSHD_CONFIG"
   echo "    sshd 备份:   ${SSHD_CONFIG}.${BACKUP_SUFFIX}"
+  echo "    metrics:     http://127.0.0.1:${METRICS_PORT}/metrics.json"
   echo ""
 }
 
@@ -546,20 +558,38 @@ install_metrics_agent() {
   step "安装服务器监控探针 (metrics-agent)"
 
   if systemctl is-active --quiet ssh-metrics.service 2>/dev/null; then
-    info "ssh-metrics.service 已在运行（跳过）"
-    return 0
+    info "ssh-metrics.service 已在运行，将刷新配置并重启"
   fi
 
   if [[ "$DRY_RUN" == true ]]; then
-    info "[DRY-RUN] 将安装 metrics-agent（端口 9101）"
+    info "[DRY-RUN] 将安装 metrics-agent（端口 ${METRICS_PORT}）"
     return 0
   fi
 
-  local SCRIPT_URL="https://raw.githubusercontent.com/chunzhimoe/cfbash/main/metrics-agent.sh"
-  info "下载并安装 metrics-agent..."
-  curl -fsSL "$SCRIPT_URL" -o /tmp/metrics-agent.sh
-  bash /tmp/metrics-agent.sh install
-  rm -f /tmp/metrics-agent.sh
+  local script_url="https://raw.githubusercontent.com/chunzhimoe/cfbash/main/metrics-agent.sh"
+  local agent_script=""
+  local tmp_dir=""
+
+  if [[ -f "$SCRIPT_DIR/metrics-agent.sh" ]]; then
+    agent_script="$SCRIPT_DIR/metrics-agent.sh"
+    info "使用本地 metrics-agent.sh 安装..."
+  else
+    tmp_dir="$(mktemp -d)"
+    agent_script="$tmp_dir/metrics-agent.sh"
+    info "下载 metrics-agent.sh..."
+    curl -fsSL "$script_url" -o "$agent_script"
+
+    if [[ -f "$SCRIPT_DIR/metrics_server.py" ]]; then
+      cp "$SCRIPT_DIR/metrics_server.py" "$tmp_dir/metrics_server.py"
+    fi
+  fi
+
+  METRICS_PORT="$METRICS_PORT" bash "$agent_script" install
+
+  if [[ -n "$tmp_dir" ]]; then
+    rm -rf "$tmp_dir"
+  fi
+
   info "metrics-agent 已安装 ✓"
 }
 
@@ -584,6 +614,7 @@ main() {
   info "  允许任意 principal: $ALLOW_ALL_PRINCIPALS"
   info "  安装 cloudflared:  $( [[ "$SKIP_CLOUDFLARED" == true ]] && echo '跳过' || echo '是' )"
   info "  Tunnel Token:      $( [[ -n "$TUNNEL_TOKEN" ]] && echo '已提供' || echo '未提供' )"
+  info "  Metrics 端口:      $METRICS_PORT"
   info "  Dry Run:           $DRY_RUN"
   echo ""
 
