@@ -60,7 +60,7 @@ is_interactive() {
 }
 
 # ----- 默认值 -----
-CA_PUBKEY="ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBNaOWfUfFLTlHn0EwdTk1Qs0gljISZ4o1ycKO/Aw9ZvzKmY16pFJ5Tg1ktXpR0t6s/CFIOCkPG9v9ZxiJ0yC83s= open-ssh-ca@cloudflareaccess.org"
+CA_PUBKEY=""
 SSO_EMAILS=()
 LOGIN_USERS=()
 TUNNEL_TOKEN=""
